@@ -27,7 +27,7 @@ export default {
     const KEY_PREFIX = env.DOC_PREFIX || "doc:";  // e.g. "doc:Week1-Ch1Ch2:" to constrain to one PDF
     const MAX_LIST_PAGES = 5;                     // raise if you have many keys
     const TOP_K = 5;                              
-    const MIN_SIMILARITY = 0.25;                  // tighten to be stricter (0.0–1.0)
+    const MIN_SIMILARITY = 0.15;                  // tighten to be stricter (0.0–1.0)
     const MIN_MATCHES = 1;                        // require at least this many good chunks
     // ------------------------------------------------
 
