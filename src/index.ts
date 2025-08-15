@@ -7,17 +7,14 @@ export default {
       "Access-Control-Allow-Methods": "POST, OPTIONS",
     };
 
+    // Health check & preflight
     if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (req.method !== "POST")  return new Response("POST only", { status: 405, headers: CORS });
+    if (req.method === "GET")     return new Response("OK", { headers: CORS });
+    if (req.method !== "POST")    return new Response("POST only", { status: 405, headers: CORS });
 
-    if (!env.OPENAI_API_KEY?.startsWith("sk-")) {
+    if (!env.OPENAI_API_KEY?.startsWith("sk-"))
       return new Response("Server misconfigured: missing OPENAI_API_KEY", { status: 500, headers: CORS });
-    }
-    if (!env.RAG_KV) {
-      return new Response("Server misconfigured: missing RAG_KV binding", { status: 500, headers: CORS });
-    }
 
-    // Expect { messages:[...] }, use the latest user message as the query
     let body: any = {};
     try { body = await req.json(); } catch {}
     const messages = (body.messages ?? []) as Array<{role:string, content:string}>;
@@ -25,68 +22,76 @@ export default {
     const q = lastUser?.content?.trim() || "";
     if (!q) return new Response("Empty query", { status: 400, headers: CORS });
 
-    // 1) Embed the query
-    const embResp = await fetch("https://api.openai.com/v1/embeddings", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ model: "text-embedding-3-small", input: q }),
-    });
-    if (!embResp.ok) {
-      const txt = await embResp.text();
-      return new Response(`Embedding error: ${txt}`, { status: 502, headers: CORS });
-    }
-    const embJson = await embResp.json();
-    const queryVec = embJson.data?.[0]?.embedding as number[] | undefined;
-    if (!queryVec) return new Response("Embedding failed (no vector)", { status: 502, headers: CORS });
-
-    // 2) Retrieve top-N chunks from KV using cosine similarity
-    //    For small/med corpora this is fine; for large, move to Vectorize.
+    // --- Retrieval settings (tune these) ---
     const TOP_K = 5;
-    const MAX_LIST_PAGES = 20;      // tune to your corpus size
-    const KEY_PREFIX = "doc:";      // or restrict to a single doc: e.g., `doc:Week1-Ch1Ch2:`
-    const MIN_SCORE = -1;           // keep all; raise to filter if noisy
+    const MAX_LIST_PAGES = 5;                 // keep small to avoid long scans
+    const KEY_PREFIX = env.DOC_PREFIX || "doc:"; // e.g., set to "doc:Week1-Ch1Ch2:" via wrangler var
+    const MIN_SCORE = -1;
 
-    let cursor: string | undefined = undefined;
-    let pages = 0;
-    const candidates: Array<{ text: string; score: number; id?: string; docId?: string }> = [];
+    // Try RAG; on any failure, fall back to plain chat
+    let groundedInput: Array<{role:string, content:string}> | null = null;
 
-    do {
-      const listed = await env.RAG_KV.list({ prefix: KEY_PREFIX, cursor });
-      cursor = listed.cursor;
-      pages++;
+    try {
+      if (!env.RAG_KV) throw new Error("No RAG_KV binding");
 
-      // Fetch items in parallel but avoid huge concurrency bursts
-      const batch = await Promise.all(
-        listed.keys.map(async (k) => {
-          const v = await env.RAG_KV.get(k.name);
-          if (!v) return null;
-          try {
-            const obj = JSON.parse(v);
-            const s = cosineSim(queryVec, obj.embedding as number[]);
-            return { text: obj.text as string, score: s, id: obj.id as string, docId: obj.docId as string };
-          } catch { return null; }
-        })
-      );
+      // 1) Embed query
+      const embResp = await fetch("https://api.openai.com/v1/embeddings", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model: "text-embedding-3-small", input: q }),
+      });
+      if (!embResp.ok) throw new Error(`Embedding error: ${await embResp.text()}`);
+      const embJson = await embResp.json();
+      const queryVec = embJson.data?.[0]?.embedding as number[] | undefined;
+      if (!queryVec) throw new Error("Embedding failed (no vector)");
 
-      for (const item of batch) {
-        if (item && item.score >= MIN_SCORE) candidates.push(item);
-      }
-    } while (cursor && pages < MAX_LIST_PAGES);
+      // 2) Retrieve (bounded scan)
+      const candidates: Array<{ text: string; score: number; id?: string; docId?: string }> = [];
+      let cursor: string | undefined = undefined;
+      let pages = 0;
 
-    candidates.sort((a, b) => b.score - a.score);
-    const top = candidates.slice(0, TOP_K);
-    const context = top.map((c, i) => `[#${i+1} ${c.docId ?? ""}] ${c.text}`).join("\n\n---\n\n");
+      do {
+        const listed = await env.RAG_KV.list({ prefix: KEY_PREFIX, cursor });
+        cursor = listed.cursor;
+        pages++;
 
-    // 3) Build grounded prompt
-    const grounded = [
-      { role: "system", content: "You are a strict RAG assistant. Use ONLY the provided context. If the answer isn't in context, say you don't know." },
-      { role: "user",   content: `Question: ${q}\n\nContext:\n${context || "(no context found)"}` },
-    ];
+        // fetch values in small parallel chunks
+        const batchVals = await Promise.all(
+          listed.keys.map(async (k) => {
+            const v = await env.RAG_KV.get(k.name);
+            if (!v) return null;
+            try {
+              const obj = JSON.parse(v);
+              const s = cosineSim(queryVec, obj.embedding as number[]);
+              return { text: obj.text as string, score: s, id: obj.id as string, docId: obj.docId as string };
+            } catch { return null; }
+          })
+        );
 
-    // 4) Call OpenAI Responses API and stream back to the browser
+        for (const item of batchVals) {
+          if (item && item.score >= MIN_SCORE) candidates.push(item);
+        }
+      } while (cursor && pages < MAX_LIST_PAGES);
+
+      candidates.sort((a, b) => b.score - a.score);
+      const top = candidates.slice(0, TOP_K);
+      const context = top.map((c, i) => `[#${i+1} ${c.docId ?? ""}] ${c.text}`).join("\n\n---\n\n");
+
+      groundedInput = [
+        { role: "system", content: "You are a strict RAG assistant. Use ONLY the provided context. If the answer isn't in context, say you don't know." },
+        { role: "user",   content: `Question: ${q}\n\nContext:\n${context || "(no context found)"}` },
+      ];
+    } catch (e: any) {
+      // Fall back (plain chat) — but keep CORS so the page doesn’t show “network error”
+      groundedInput = messages.length
+        ? messages
+        : [{ role: "user", content: q }];
+    }
+
+    // 3) Call OpenAI and stream
     const upstream = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
@@ -95,7 +100,7 @@ export default {
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        input: grounded,
+        input: groundedInput,
         stream: true,
       }),
     });
