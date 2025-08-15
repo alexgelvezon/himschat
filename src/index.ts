@@ -1,35 +1,42 @@
-import OpenAI from "openai";
-
 export default {
-	async fetch(request, env, ctx): Promise<Response> {
-		const openai = new OpenAI({
-			apiKey: env.OPENAI_API_KEY,
-		});
+  async fetch(req: Request, env: Env): Promise<Response> {
+    // CORS preflight
+    if (req.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Headers": "Content-Type",
+          "Access-Control-Allow-Methods": "POST, OPTIONS",
+        },
+      });
+    }
 
-		// Create a TransformStream to handle streaming data
-		let { readable, writable } = new TransformStream();
-		let writer = writable.getWriter();
-		const textEncoder = new TextEncoder();
+    if (req.method !== "POST") {
+      return new Response("POST only", { status: 405 });
+    }
 
-		ctx.waitUntil(
-			(async () => {
-				const stream = await openai.chat.completions.create({
-					model: "gpt-4o-mini",
-					messages: [{ role: "user", content: "Tell me a story" }],
-					stream: true,
-				});
+    const body = await req.json(); // { messages: [...] }
 
-				// loop over the data as it is streamed and write to the writeable
-				for await (const part of stream) {
-					writer.write(
-						textEncoder.encode(part.choices[0]?.delta?.content || ""),
-					);
-				}
-				writer.close();
-			})(),
-		);
+    const upstream = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",          // choose your model
+        input: body.messages,          // [{role, content}, ...]
+        stream: true,
+      }),
+    });
 
-		// Send the readable back to the browser
-		return new Response(readable);
-	},
+    // Pass through the SSE stream + CORS headers for your browser client
+    return new Response(upstream.body, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  },
 } satisfies ExportedHandler<Env>;
