@@ -51,11 +51,13 @@ if (req.method === "GET" && url.pathname === "/debug") {
     if (!q) return sseError("Empty query.", CORS);
     if (!env.RAG_KV) return sseError("No document store is configured.", CORS);
 
-    // ---------- Retrieval (strict) ----------
-    const KEY_PREFIX = (env.DOC_PREFIX ?? ""); // narrow to a single doc by setting DOC_PREFIX
-    const MAX_LIST_PAGES = 5;    // raise if you have many chunks
-    const TOP_K = 5;
-    const MIN_SIM = 0.20;        // tighten/loosen as needed
+// ---------- Retrieval (strict) ----------
+const KEY_PREFIX = (env.DOC_PREFIX ?? "doc:");
+const MAX_LIST_PAGES = 12;   // was 5; scans up to ~12,000 keys
+const MAX_KEYS = 3000;       // hard cap on how many values we fetch+score per request
+const TOP_K = 5;
+const MIN_SIM = 0.10;        // lower to 0.10 temporarily if testing
+
 
     // 1) Embed the query
     const embResp = await fetch("https://api.openai.com/v1/embeddings", {
@@ -76,32 +78,43 @@ if (req.method === "GET" && url.pathname === "/debug") {
 
     // 2) Scan KV and score (bounded)
     const candidates: Array<{ text: string; score: number; id?: string; docId?: string }> = [];
-    let cursor: string | undefined;
-    let pages = 0;
+let cursor: string | undefined;
+let pages = 0;
+let processed = 0;
 
-    try {
-      do {
-        const listed = await env.RAG_KV.list({ prefix: KEY_PREFIX, cursor });
-        cursor = listed.cursor;
-        pages++;
+try {
+  do {
+    const listed = await env.RAG_KV.list({ prefix: KEY_PREFIX, cursor });
+    cursor = listed.cursor;
+    pages++;
 
-        const batch = await Promise.all(
-          listed.keys.map(async (k) => {
-            const v = await env.RAG_KV.get(k.name);
-            if (!v) return null;
-            try {
-              const obj = JSON.parse(v);
-              const s = cosineSim(queryVec, obj.embedding as number[]);
-              return { text: obj.text as string, score: s, id: obj.id as string, docId: obj.docId as string };
-            } catch { return null; }
-          })
-        );
+    // Avoid fetching too many values in one go
+    const remaining = Math.max(0, MAX_KEYS - processed);
+    const slice = listed.keys.slice(0, remaining);
 
-        for (const item of batch) if (item) candidates.push(item);
-      } while (cursor && pages < MAX_LIST_PAGES);
-    } catch {
-      return sseError("I can only answer from your documents, and I couldn’t access them right now.", CORS);
-    }
+    const batch = await Promise.all(
+      slice.map(async (k) => {
+        const v = await env.RAG_KV.get(k.name);
+        if (!v) return null;
+        try {
+          const obj = JSON.parse(v);
+          const s = cosineSim(queryVec, obj.embedding as number[]);
+          return { text: obj.text as string, score: s, id: obj.id as string, docId: obj.docId as string };
+        } catch { return null; }
+      })
+    );
+
+    for (const item of batch) if (item) candidates.push(item);
+    processed += slice.length;
+
+    // ✅ Stop early once we hit MAX_KEYS
+    if (processed >= MAX_KEYS) break;
+
+  } while (cursor && pages < MAX_LIST_PAGES);
+} catch {
+  return sseError("I can only answer from your documents, and I couldn’t access them right now.", CORS);
+}
+
 
     candidates.sort((a, b) => b.score - a.score);
     const top = candidates.filter(c => c.score >= MIN_SIM).slice(0, TOP_K);
