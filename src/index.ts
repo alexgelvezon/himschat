@@ -7,6 +7,27 @@ export interface Env {
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
+
+    const url = new URL(req.url);
+if (req.method === "GET" && url.pathname === "/debug") {
+  if (!env.RAG_KV) {
+    return new Response(JSON.stringify({ error: "No RAG_KV binding" }), {
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+    });
+  }
+  const prefix = (env.DOC_PREFIX ?? "doc:");   // or "" if you changed it above
+  const list = await env.RAG_KV.list({ prefix });
+  const sample = list.keys.slice(0, 20).map(k => k.name);
+  return new Response(JSON.stringify({
+    boundNamespace: "RAG_KV",
+    usingPrefix: prefix,
+    returnedThisPage: list.keys.length,
+    cursor: list.cursor || null,
+    sampleKeys: sample
+  }, null, 2), {
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+  });
+}
     const CORS = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": "Content-Type",
