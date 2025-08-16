@@ -11,7 +11,7 @@
 
   // Bindings
   "kv_namespaces": [
-    { "binding": "RAG_KV", "id": "d0c1a992d32c4ff9ac5c3df9c6321c4f" }
+    { "binding": "RAG_KV", "id": "dd8be97d5ec9419d9226cc29fe2c4ae4" }
   ]
 
   // Optional: enable Smart Placement if you like
