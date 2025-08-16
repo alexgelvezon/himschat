@@ -2,7 +2,7 @@
 export interface Env {
   OPENAI_API_KEY: string;
   RAG_KV: KVNamespace;
-  DOC_PREFIX?: string; // optional: e.g. "doc:Week1-Ch1Ch2:"
+  DOC_PREFIX?: string; // optional: e.g. ""
 }
 
 export default {
@@ -31,7 +31,7 @@ export default {
     if (!env.RAG_KV) return sseError("No document store is configured.", CORS);
 
     // ---------- Retrieval (strict) ----------
-    const KEY_PREFIX = (env.DOC_PREFIX ?? "doc:"); // narrow to a single doc by setting DOC_PREFIX
+    const KEY_PREFIX = (env.DOC_PREFIX ?? ""); // narrow to a single doc by setting DOC_PREFIX
     const MAX_LIST_PAGES = 5;    // raise if you have many chunks
     const TOP_K = 5;
     const MIN_SIM = 0.20;        // tighten/loosen as needed
