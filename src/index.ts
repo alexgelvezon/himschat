@@ -1,96 +1,56 @@
-// src/index.ts
-import { Ai } from "@cloudflare/ai";
-
+// src/index.ts — clean, Responses API, SSE always, strict RAG if docs exist
 export interface Env {
   OPENAI_API_KEY: string;
   RAG_KV: KVNamespace;
+  DOC_PREFIX?: string; // optional: set in wrangler vars to restrict to one doc, e.g. "doc:Week1-Ch1Ch2:"
 }
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
-    if (req.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type",
-        },
-      });
+    const CORS = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+    };
+
+    if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
+    if (req.method === "GET")     return new Response("OK", { headers: CORS });
+    if (req.method !== "POST")    return new Response("POST only", { status: 405, headers: CORS });
+
+    // Parse input safely
+    let body: any = {};
+    try { body = await req.json(); } catch { body = {}; }
+    const messages = (body.messages ?? []) as Array<{role:string, content:string}>;
+    const lastUser = [...messages].reverse().find(m => m.role === "user");
+    const q = lastUser?.content?.trim() || "";
+
+    // Basic guards
+    if (!env.OPENAI_API_KEY?.startsWith("sk-"))
+      return sseError("Server misconfigured: missing OPENAI_API_KEY", CORS);
+    if (!q) return sseError("Empty query.", CORS);
+
+    // If KV not bound, just refuse (keeps behavior strict to RAG)
+    if (!env.RAG_KV) return sseError("No document store is configured.", CORS);
+
+    // ---------- Retrieval (strict) ----------
+    const KEY_PREFIX = (env.DOC_PREFIX ?? "doc:"); // restrict if desired
+    const MAX_LIST_PAGES = 5;    // raise if you have lots of chunks
+    const TOP_K = 5;
+    const MIN_SIM = 0.20;        // tighten/loosen as you wish
+
+    // 1) Embed the query
+    const embResp = await fetch("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "text-embedding-3-small", input: q }),
+    });
+    if (!embResp.ok) {
+      const txt = await embResp.text();
+      return sseError(`Embedding error: ${txt}`, CORS);
     }
-
-    if (req.method !== "POST") {
-      return new Response("Only POST supported", { status: 405 });
-    }
-
-    try {
-      const { messages } = await req.json<{ messages: { role: string; content: string }[] }>();
-      const userMsg = messages[messages.length - 1].content;
-
-      // 1. Retrieve docs from KV
-      const kvKeys = await env.RAG_KV.list({ prefix: "doc:" });
-      if (!kvKeys.keys.length) {
-        return new Response(JSON.stringify({
-          type: "error",
-          message: "No documents available. Please upload first."
-        }), {
-          status: 200,
-          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-        });
-      }
-
-      // For now, just grab first few docs (in production you'd filter by embeddings)
-      const docs = [];
-      for (const key of kvKeys.keys.slice(0, 5)) {
-        const text = await env.RAG_KV.get(key.name);
-        if (text) docs.push(text);
-      }
-
-      if (!docs.length) {
-        return new Response(JSON.stringify({
-          type: "error",
-          message: "I couldn’t find any context in your documents."
-        }), {
-          status: 200,
-          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-        });
-      }
-
-      // 2. Call OpenAI API with docs as context
-      const prompt = `Answer based ONLY on the following docs:\n\n${docs.join("\n\n")}\n\nUser: ${userMsg}`;
-
-      const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          messages: [
-            { role: "system", content: "You are a helpful assistant. Only answer using the provided docs. If unsure, say 'Sorry, I don’t know from the documents provided.'" },
-            { role: "user", content: prompt },
-          ],
-          stream: true,
-        }),
-      });
-
-      // 3. Stream back to client
-      return new Response(resp.body, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Access-Control-Allow-Origin": "*",
-        },
-      });
-
-    } catch (err: any) {
-      return new Response(JSON.stringify({
-        type: "error",
-        message: err?.message || "Unknown error"
-      }), {
-        status: 500,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
-    }
-  },
-};
+    const embJson = await embResp.json();
+    const queryVec = embJson.data?.[0]?.embedding as number[] | undefined;
+    if (!queryVec) return sseError("Em
