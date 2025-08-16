@@ -1,60 +1,96 @@
-export interface Env { }
+// src/index.ts
+import { Ai } from "@cloudflare/ai";
 
-const CORS = {
-  "Access-Control-Allow-Origin": "*", // set to your site origin in prod
-  "Access-Control-Allow-Headers": "content-type, authorization",
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-};
+export interface Env {
+  OPENAI_API_KEY: string;
+  RAG_KV: KVNamespace;
+}
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
-    const url = new URL(req.url);
-    if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
-
-    // 1) Minimal SSE that *must* stream "tick 1..10"
-    if (url.pathname === "/sse-test") {
-      const { readable, writable } = new TransformStream();
-      const writer = writable.getWriter();
-      const enc = new TextEncoder();
-
-      (async () => {
-        try {
-          for (let i = 1; i <= 10; i++) {
-            await writer.write(enc.encode(`data: tick ${i}\n\n`));
-            await new Promise(r => setTimeout(r, 250));
-          }
-          await writer.write(enc.encode(`data: [DONE]\n\n`));
-        } finally {
-          writer.close();
-        }
-      })();
-
-      return new Response(readable, {
+    if (req.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
         headers: {
-          ...CORS,
-          "content-type": "text/event-stream; charset=utf-8",
-          "cache-control": "no-cache, no-transform",
-          "x-accel-buffering": "no",
-          "connection": "keep-alive",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
         },
       });
     }
 
-    // 2) Plain echo (no SSE) so you know POST works and returns immediately
-    if (url.pathname === "/echo" && req.method === "POST") {
-      const body = await req.text();
-      return new Response(`echo: ${body}`, { headers: { ...CORS, "content-type": "text/plain" } });
+    if (req.method !== "POST") {
+      return new Response("Only POST supported", { status: 405 });
     }
 
-    // 3) Optional: headers debug to catch CORS/preflight/routing issues
-    if (url.pathname === "/debug/headers") {
-      const entries: Record<string, string> = {};
-      for (const [k, v] of req.headers) entries[k] = v;
-      return new Response(JSON.stringify(entries, null, 2), {
-        headers: { ...CORS, "content-type": "application/json" },
+    try {
+      const { messages } = await req.json<{ messages: { role: string; content: string }[] }>();
+      const userMsg = messages[messages.length - 1].content;
+
+      // 1. Retrieve docs from KV
+      const kvKeys = await env.RAG_KV.list({ prefix: "doc:" });
+      if (!kvKeys.keys.length) {
+        return new Response(JSON.stringify({
+          type: "error",
+          message: "No documents available. Please upload first."
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+
+      // For now, just grab first few docs (in production you'd filter by embeddings)
+      const docs = [];
+      for (const key of kvKeys.keys.slice(0, 5)) {
+        const text = await env.RAG_KV.get(key.name);
+        if (text) docs.push(text);
+      }
+
+      if (!docs.length) {
+        return new Response(JSON.stringify({
+          type: "error",
+          message: "I couldn’t find any context in your documents."
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+
+      // 2. Call OpenAI API with docs as context
+      const prompt = `Answer based ONLY on the following docs:\n\n${docs.join("\n\n")}\n\nUser: ${userMsg}`;
+
+      const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: "You are a helpful assistant. Only answer using the provided docs. If unsure, say 'Sorry, I don’t know from the documents provided.'" },
+            { role: "user", content: prompt },
+          ],
+          stream: true,
+        }),
+      });
+
+      // 3. Stream back to client
+      return new Response(resp.body, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+
+    } catch (err: any) {
+      return new Response(JSON.stringify({
+        type: "error",
+        message: err?.message || "Unknown error"
+      }), {
+        status: 500,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
-
-    return new Response("ok", { headers: CORS });
-  }
+  },
 };
