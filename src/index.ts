@@ -104,13 +104,15 @@ export default {
     const context = top.map((c, i) => `[#${i + 1} ${c.docId ?? ""}] ${c.text}`).join("\n\n---\n\n");
 
     // 3) Call OpenAI Responses API and stream back
-    const upstream = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
+    \
+const upstream = await fetch("https://api.openai.com/v1/responses", {
+  method: "POST",
+  headers: {
+    "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+    "Content-Type": "application/json",
+    "Accept": "text/event-stream",
+  },
+  body: JSON.stringify({
         model: "gpt-4o-mini",
         input: [
           {
@@ -123,55 +125,83 @@ export default {
           { role: "user", content: `Question: ${q}\n\nContext:\n${context}` },
         ],
         stream: true,
-      }),
-    });
+      }), // keep your existing request payload
+});
 
-    if (!upstream.ok) {
-      const txt = await upstream.text();
-      return sseError(`OpenAI error: ${txt}`, CORS);
+if (!upstream.ok || !upstream.body) {
+  const text = await upstream.text();
+  // sseError helper may exist in your file; if not, send a JSON error
+  if (typeof sseError === "function") {
+    return sseError(`OpenAI upstream error: ${upstream.status} ${text}`, CORS);
+  } else {
+    return new Response(JSON.stringify({ error: "OpenAI upstream error", detail: text }), {
+      status: 502,
+      headers: { "Content-Type": "application/json", ...CORS },
+    });
+  }
+}
+
+// --- Filter the SSE so the browser only sees text deltas + completed ---
+const { readable, writable } = new TransformStream();
+const writer = writable.getWriter();
+const enc = new TextEncoder();
+const reader = upstream.body.getReader();
+const decoder = new TextDecoder();
+let __sse_buf = "";
+
+async function __emit(obj: unknown) {
+  await writer.write(enc.encode(`data: ${JSON.stringify(obj)}\\n\\n`));
+}
+
+(async () => {
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      __sse_buf += decoder.decode(value, { stream: true });
+
+      let idx;
+      while ((idx = __sse_buf.indexOf("\\n\\n")) !== -1) {
+        const raw = __sse_buf.slice(0, idx);
+        __sse_buf = __sse_buf.slice(idx + 2);
+
+        const evt = { event: "", data: "" };
+        for (const line of raw.split("\\n")) {
+          if (line.startsWith("event:")) evt.event = line.slice(6).trim();
+          else if (line.startsWith("data:")) evt.data += (evt.data ? "\\n" : "") + line.slice(5).trim();
+        }
+
+        if (!evt.data) continue;
+        try {
+          const obj = JSON.parse(evt.data);
+          const t = obj.type;
+          if (t === "response.output_text.delta" && obj.delta) {
+            await __emit({ type: t, delta: obj.delta });
+          } else if (t === "response.completed") {
+            await __emit({ type: t });
+          } else if (t === "response.error" && obj.error) {
+            await __emit({ type: t, error: obj.error });
+          }
+        } catch {
+          // ignore non-JSON frames
+        }
+      }
     }
+  } catch (e: any) {
+    await __emit({ type: "response.error", error: { message: e?.message || String(e) } });
+  } finally {
+    await writer.close();
+  }
+})();
 
-    return new Response(upstream.body, {
-      headers: {
-        ...CORS,
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-      },
-    });
+return new Response(readable, {
+  headers: {
+    ...(typeof CORS !== "undefined" ? CORS : {}),
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
   },
-} satisfies ExportedHandler<Env>;
-
-// ---------- helpers ----------
-async function embedText(text: string, apiKey: string): Promise<number[] | null> {
-  const resp = await fetch("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "text-embedding-3-small", input: text }),
-  });
-  if (!resp.ok) return null;
-  const json = await resp.json();
-  return (json?.data?.[0]?.embedding as number[] | undefined) ?? null;
-}
-
-function cosineSim(a: number[], b: number[]) {
-  if (!a || !b) return -1;
-  let dot = 0, na = 0, nb = 0;
-  const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-12);
-}
-
-function sseText(text: string, cors: Record<string, string>) {
-  const enc = new TextEncoder();
-  const stream = new ReadableStream({
-    start(c) {
-      c.enqueue(enc.encode(`data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n`));
-      c.enqueue(enc.encode(`data: ${JSON.stringify({ type: "response.completed" })}\n\n`));
-      c.close();
-    }
-  });
-  return new Response(stream, { headers: { ...cors, "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
+});return new Response(stream, { headers: { ...cors, "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
 }
 
 function sseError(text: string, cors: Record<string, string>) { return sseText(`[Error] ${text}`, cors); }
